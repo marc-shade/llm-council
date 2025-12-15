@@ -1,8 +1,21 @@
-"""3-stage LLM Council orchestration."""
+"""3-stage LLM Council orchestration.
+
+Supports both CLI providers (Claude, Codex, Gemini) and OpenRouter API.
+"""
 
 from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, PROVIDER_MODE, PROVIDER_DISPLAY_NAMES
+
+# Import appropriate provider based on mode
+if PROVIDER_MODE == "cli":
+    from .cli_providers import query_models_parallel, query_model
+else:
+    from .openrouter import query_models_parallel, query_model
+
+
+def get_display_name(model: str) -> str:
+    """Get human-readable display name for a model."""
+    return PROVIDER_DISPLAY_NAMES.get(model, model)
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -26,6 +39,7 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
         if response is not None:  # Only include successful responses
             stage1_results.append({
                 "model": model,
+                "display_name": get_display_name(model),
                 "response": response.get('content', '')
             })
 
@@ -105,6 +119,7 @@ Now provide your evaluation and ranking:"""
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": model,
+                "display_name": get_display_name(model),
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
@@ -130,12 +145,12 @@ async def stage3_synthesize_final(
     """
     # Build comprehensive context for chairman
     stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
+        f"Model: {result.get('display_name', result['model'])}\nResponse: {result['response']}"
         for result in stage1_results
     ])
 
     stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
+        f"Model: {result.get('display_name', result['model'])}\nRanking: {result['ranking']}"
         for result in stage2_results
     ])
 
@@ -165,11 +180,13 @@ Provide a clear, well-reasoned final answer that represents the council's collec
         # Fallback if chairman fails
         return {
             "model": CHAIRMAN_MODEL,
+            "display_name": get_display_name(CHAIRMAN_MODEL),
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
         "model": CHAIRMAN_MODEL,
+        "display_name": get_display_name(CHAIRMAN_MODEL),
         "response": response.get('content', '')
     }
 
@@ -245,6 +262,7 @@ def calculate_aggregate_rankings(
             avg_rank = sum(positions) / len(positions)
             aggregate.append({
                 "model": model,
+                "display_name": get_display_name(model),
                 "average_rank": round(avg_rank, 2),
                 "rankings_count": len(positions)
             })
@@ -274,8 +292,13 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    # Use gemini for title generation (fast)
+    if PROVIDER_MODE == "cli":
+        title_model = "gemini"
+    else:
+        title_model = "google/gemini-2.5-flash"
+
+    response = await query_model(title_model, messages, timeout=30.0)
 
     if response is None:
         # Fallback to a generic title
@@ -329,7 +352,8 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     # Prepare metadata
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
+        "provider_mode": PROVIDER_MODE
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

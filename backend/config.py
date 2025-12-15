@@ -1,26 +1,64 @@
-"""Configuration for the LLM Council."""
+"""Configuration for the LLM Council - CLI Provider Edition.
+
+This version uses local CLI tools (Claude Code, Codex, Gemini) instead of OpenRouter.
+"""
 
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# OpenRouter API key
+# Provider mode: "cli" for local CLIs, "openrouter" for API
+PROVIDER_MODE = os.getenv("PROVIDER_MODE", "cli")
+
+# OpenRouter API key (only used if PROVIDER_MODE == "openrouter")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Council members - list of OpenRouter model identifiers
-COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+# CLI Council Configuration
+# These are the local CLI tools that form the council
+CLI_COUNCIL_MODELS = [
+    "claude",   # Claude Code CLI (Anthropic)
+    "codex",    # Codex CLI (OpenAI)
+    "gemini",   # Gemini CLI (Google)
 ]
 
-# Chairman model - synthesizes final response
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+# CLI Chairman model - synthesizes final response
+CLI_CHAIRMAN_MODEL = "codex"  # Codex as chairman (most reliable)
 
-# OpenRouter API endpoint
+# OpenRouter Council Configuration (legacy/alternative)
+OPENROUTER_COUNCIL_MODELS = [
+    "openai/gpt-4.1",
+    "google/gemini-2.5-pro-preview",
+    "anthropic/claude-sonnet-4",
+    "x-ai/grok-3",
+]
+
+OPENROUTER_CHAIRMAN_MODEL = "anthropic/claude-sonnet-4"
+
+# Active configuration based on mode
+if PROVIDER_MODE == "cli":
+    COUNCIL_MODELS = CLI_COUNCIL_MODELS
+    CHAIRMAN_MODEL = CLI_CHAIRMAN_MODEL
+else:
+    COUNCIL_MODELS = OPENROUTER_COUNCIL_MODELS
+    CHAIRMAN_MODEL = OPENROUTER_CHAIRMAN_MODEL
+
+# OpenRouter API endpoint (only used if PROVIDER_MODE == "openrouter")
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Data directory for conversation storage
 DATA_DIR = "data/conversations"
+
+# Display names for CLI providers
+PROVIDER_DISPLAY_NAMES = {
+    "claude": "Claude Code (Anthropic)",
+    "codex": "Codex CLI (OpenAI)",
+    "gemini": "Gemini CLI (Google)",
+}
+
+# Timeouts for each provider (CLI tools can be slower)
+PROVIDER_TIMEOUTS = {
+    "claude": 180.0,
+    "codex": 180.0,
+    "gemini": 180.0,
+}
