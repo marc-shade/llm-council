@@ -44,6 +44,38 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - FastAPI app with CORS enabled for localhost:5173 and localhost:3000
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
 - Metadata includes: label_to_model mapping and aggregate_rankings
+- **MCP-Friendly Endpoints** (for thin MCP server):
+  - `GET /api/mcp/health` - Health check with mcp_ready flag
+  - `GET /api/mcp/providers` - List available CLI providers
+  - `POST /api/mcp/query` - Quick single-provider query
+  - `GET /api/mcp/patterns` - List deliberation patterns
+  - `POST /api/mcp/patterns/run` - Run specific pattern
+  - `POST /api/mcp/compare` - Compare all providers
+  - `POST /api/mcp/deliberate` - Full council deliberation
+
+**`cli_providers.py`**
+- CLI-based provider interface (Claude Code, Codex CLI, Gemini CLI)
+- Uses subprocess to run CLI tools directly
+- **Claude Auth Fix**: Sets `ANTHROPIC_API_KEY=""` to force OAuth/subscription auth
+- Supports both direct query and file-based query methods
+- `query_cli_provider()`: Single provider async query
+- `query_providers_parallel()`: Parallel queries to multiple providers
+- `get_available_providers()`: Returns list of installed CLI tools
+
+**`patterns.py`**
+- 9 deliberation patterns: deliberation, debate, devils_advocate, socratic, red_team, tree_of_thought, self_consistency, round_robin, expert_panel
+- `list_patterns()`: Returns pattern metadata
+- `run_pattern()`: Executes specific pattern flow
+
+### MCP Integration (`llm_council_mcp/`)
+
+**`thin_server.py`** - Stable MCP Wrapper
+- Thin MCP server that proxies to HTTP backend
+- Solves stdio connection stability issues during long CLI operations
+- Uses httpx with 300s timeout for async HTTP requests
+- Tools: council_deliberate, council_quick_query, council_get_providers, council_list_patterns, council_run_pattern, council_compare_providers
+
+**Architecture**: MCP stdio → thin_server.py → HTTP backend (port 8001) → CLI providers
 
 ### Frontend Structure (`frontend/src/`)
 
@@ -125,12 +157,37 @@ All ReactMarkdown components must be wrapped in `<div className="markdown-conten
 ### Model Configuration
 Models are hardcoded in `backend/config.py`. Chairman can be same or different from council members. The current default is Gemini as chairman per user preference.
 
+## Starting the Services
+
+### HTTP Backend (Required for MCP)
+```bash
+cd llm-council
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 8001
+```
+
+### MCP Server Configuration
+Add to `~/.claude.json`:
+```json
+{
+  "mcpServers": {
+    "llm-council": {
+      "command": "python3",
+      "args": ["/path/to/llm-council/llm_council_mcp/thin_server.py"]
+    }
+  }
+}
+```
+
+The thin server proxies to the HTTP backend, keeping the MCP stdio connection stable during long CLI operations.
+
 ## Common Gotchas
 
 1. **Module Import Errors**: Always run backend as `python -m backend.main` from project root, not from backend directory
 2. **CORS Issues**: Frontend must match allowed origins in `main.py` CORS middleware
 3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns in order
 4. **Missing Metadata**: Metadata is ephemeral (not persisted), only available in API responses
+5. **MCP Connection Drops**: Use thin_server.py (not direct server.py) - it proxies to HTTP backend for stability
+6. **Claude CLI Auth**: Claude Code must use OAuth auth (empty API key) - the cli_providers.py handles this automatically
 
 ## Future Enhancement Ideas
 

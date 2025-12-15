@@ -11,6 +11,9 @@ import asyncio
 
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, PROVIDER_DISPLAY_NAMES
+from .cli_providers import query_cli_provider, query_providers_parallel, get_available_providers, get_provider_info
+from .patterns import Pattern, list_patterns, run_pattern
 
 app = FastAPI(title="LLM Council API")
 
@@ -192,6 +195,146 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             "Connection": "keep-alive",
         }
     )
+
+
+# ============================================================================
+# MCP-Friendly Endpoints (used by thin MCP server)
+# ============================================================================
+
+class QuickQueryRequest(BaseModel):
+    """Request for quick single-provider query."""
+    provider: str
+    prompt: str
+    timeout: float = 60.0
+
+
+class RunPatternRequest(BaseModel):
+    """Request to run a deliberation pattern."""
+    pattern: str
+    question: str
+    rounds: int = 2
+    branches: int = 3
+
+
+class CompareRequest(BaseModel):
+    """Request to compare all providers."""
+    prompt: str
+
+
+@app.get("/api/mcp/health")
+async def mcp_health():
+    """Health check for MCP integration."""
+    return {"status": "healthy", "service": "llm-council", "mcp_ready": True}
+
+
+@app.get("/api/mcp/providers")
+async def get_providers():
+    """Get available LLM providers for MCP."""
+    providers = []
+    for name in get_available_providers():
+        info = get_provider_info(name)
+        if info:
+            providers.append({
+                "name": name,
+                "display_name": info["display_name"],
+                "is_chairman": name == CHAIRMAN_MODEL,
+                "timeout": info["timeout"]
+            })
+
+    return {
+        "mode": "cli",
+        "council_members": len(COUNCIL_MODELS),
+        "chairman": PROVIDER_DISPLAY_NAMES.get(CHAIRMAN_MODEL, CHAIRMAN_MODEL),
+        "providers": providers
+    }
+
+
+@app.post("/api/mcp/query")
+async def quick_query(request: QuickQueryRequest):
+    """Query a single provider (for MCP)."""
+    result = await query_cli_provider(
+        request.provider,
+        request.prompt,
+        timeout=request.timeout
+    )
+
+    if result and result.get("content"):
+        return {"success": True, "content": result["content"]}
+    else:
+        return {"success": False, "error": f"{request.provider} failed to respond"}
+
+
+@app.get("/api/mcp/patterns")
+async def get_patterns():
+    """List available deliberation patterns."""
+    return {"patterns": list_patterns()}
+
+
+@app.post("/api/mcp/patterns/run")
+async def run_pattern_endpoint(request: RunPatternRequest):
+    """Run a specific deliberation pattern."""
+    try:
+        pattern = Pattern(request.pattern)
+    except ValueError:
+        available = [p.value for p in Pattern]
+        raise HTTPException(400, f"Unknown pattern '{request.pattern}'. Available: {available}")
+
+    try:
+        result = await run_pattern(
+            pattern,
+            request.question,
+            rounds=request.rounds,
+            branches=request.branches
+        )
+        return {"success": True, "result": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/mcp/compare")
+async def compare_providers(request: CompareRequest):
+    """Compare all providers on the same prompt."""
+    results = await query_providers_parallel(COUNCIL_MODELS, request.prompt)
+
+    responses = []
+    for model, response in results.items():
+        display_name = PROVIDER_DISPLAY_NAMES.get(model, model)
+        if response and response.get("content"):
+            responses.append({
+                "provider": model,
+                "display_name": display_name,
+                "content": response["content"],
+                "success": True
+            })
+        else:
+            responses.append({
+                "provider": model,
+                "display_name": display_name,
+                "content": None,
+                "success": False
+            })
+
+    return {"responses": responses}
+
+
+@app.post("/api/mcp/deliberate")
+async def mcp_deliberate(request: SendMessageRequest):
+    """Run full council deliberation (for MCP, no conversation storage)."""
+    try:
+        stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
+            request.content
+        )
+        return {
+            "success": True,
+            "result": {
+                "stage1": stage1_results,
+                "stage2": stage2_results,
+                "stage3": stage3_result,
+                "metadata": metadata
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":
