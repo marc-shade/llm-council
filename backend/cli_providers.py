@@ -133,9 +133,10 @@ async def _query_direct(
     env = os.environ.copy()
     env["NO_COLOR"] = "1"  # Disable color codes in output
 
-    # For Claude, unset ANTHROPIC_API_KEY to use subscription auth instead of API credits
+    # For Claude, set ANTHROPIC_API_KEY to empty string to force OAuth/subscription auth
+    # (Just removing the env var isn't enough - Claude CLI may read from config files)
     if provider.provider_type == ProviderType.CLAUDE:
-        env.pop("ANTHROPIC_API_KEY", None)
+        env["ANTHROPIC_API_KEY"] = ""
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -178,10 +179,10 @@ async def _query_with_file(
             # Claude can read from stdin
             cmd = ["claude", "--print"]
 
-            # Set up environment - unset API key to use subscription auth
+            # Set up environment - empty API key to force OAuth/subscription auth
             env = os.environ.copy()
             env["NO_COLOR"] = "1"
-            env.pop("ANTHROPIC_API_KEY", None)
+            env["ANTHROPIC_API_KEY"] = ""
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
