@@ -7,10 +7,13 @@ Enables Claude Code to invoke multi-LLM council deliberations directly from CLI.
 
 Tools:
 - council_deliberate: Run full 3-stage council deliberation
+- council_run_pattern: Run any deliberation pattern (debate, socratic, red_team, etc.)
+- council_list_patterns: List available deliberation patterns
 - council_quick_query: Query a single provider for fast responses
 - council_get_providers: List available LLM providers
 - council_get_conversations: List past deliberations
 - council_get_conversation: Get specific conversation details
+- council_compare_providers: Compare all providers on same prompt
 """
 
 import asyncio
@@ -54,6 +57,12 @@ from backend.config import (
     CHAIRMAN_MODEL,
     PROVIDER_MODE,
     PROVIDER_DISPLAY_NAMES,
+)
+from backend.patterns import (
+    Pattern,
+    PATTERN_INFO,
+    list_patterns,
+    run_pattern,
 )
 
 
@@ -179,6 +188,69 @@ Does NOT include ranking or synthesis - just raw parallel responses.""",
                 "required": ["prompt"]
             }
         ),
+        Tool(
+            name="council_list_patterns",
+            description="""List all available deliberation patterns.
+
+Each pattern represents a different multi-mind collaboration strategy:
+- deliberation: Default 3-stage (respond → rank → synthesize)
+- debate: Pro vs Con with judge
+- devils_advocate: Answer challenged by critic, then refined
+- socratic: Question-driven dialogue for deeper understanding
+- red_team: Blue proposes, red attacks, iterate to robust solution
+- tree_of_thought: Explore branches, prune, find best path
+- self_consistency: Multiple samples with majority voting
+- round_robin: Sequential building on previous responses
+- expert_panel: Route to domain specialists""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="council_run_pattern",
+            description="""Run a specific deliberation pattern on a question.
+
+Different patterns suit different use cases:
+- debate: Best for controversial topics, pros/cons analysis
+- devils_advocate: Best for stress-testing ideas, finding weaknesses
+- socratic: Best for complex reasoning, philosophical questions
+- red_team: Best for security analysis, robustness testing
+- tree_of_thought: Best for problem solving, strategic planning
+- self_consistency: Best for high-confidence factual answers
+- round_robin: Best for creative tasks, brainstorming
+- expert_panel: Best for domain-specific technical questions
+
+Use council_list_patterns to see all options with details.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Pattern to use",
+                        "enum": ["deliberation", "debate", "devils_advocate", "socratic",
+                                "red_team", "tree_of_thought", "self_consistency",
+                                "round_robin", "expert_panel"]
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The question to deliberate on"
+                    },
+                    "rounds": {
+                        "type": "integer",
+                        "description": "Number of rounds for patterns that support it (socratic: 2, etc.)",
+                        "default": 2
+                    },
+                    "branches": {
+                        "type": "integer",
+                        "description": "Number of branches for tree_of_thought pattern",
+                        "default": 3
+                    }
+                },
+                "required": ["pattern", "question"]
+            }
+        ),
     ]
 
 
@@ -198,6 +270,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         return await handle_get_conversation(arguments)
     elif name == "council_compare_providers":
         return await handle_compare_providers(arguments)
+    elif name == "council_list_patterns":
+        return await handle_list_patterns(arguments)
+    elif name == "council_run_pattern":
+        return await handle_run_pattern(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -415,6 +491,113 @@ async def handle_compare_providers(args: Dict[str, Any]) -> List[TextContent]:
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error comparing providers: {str(e)}")]
+
+
+async def handle_list_patterns(args: Dict[str, Any]) -> List[TextContent]:
+    """List all available deliberation patterns."""
+    output_parts = []
+    output_parts.append("**Available Deliberation Patterns**\n")
+    output_parts.append("Each pattern represents a different multi-mind collaboration strategy:\n")
+
+    patterns = list_patterns()  # Returns list of dicts with pattern info
+    for info in patterns:
+        output_parts.append(f"### {info['name']}")
+        output_parts.append(f"**Pattern ID:** `{info['id']}`")
+        output_parts.append(f"**Description:** {info['description']}")
+        output_parts.append(f"**Best For:** {', '.join(info['best_for'])}")
+        output_parts.append(f"**Flow:** {info['flow']}")
+        output_parts.append("")
+
+    return [TextContent(type="text", text="\n".join(output_parts))]
+
+
+async def handle_run_pattern(args: Dict[str, Any]) -> List[TextContent]:
+    """Run a specific deliberation pattern."""
+    pattern_name = args.get("pattern", "")
+    question = args.get("question", "")
+    rounds = args.get("rounds", 2)
+    branches = args.get("branches", 3)
+
+    if not pattern_name or not question:
+        return [TextContent(type="text", text="Error: Pattern and question are required")]
+
+    try:
+        # Convert pattern name to enum
+        try:
+            pattern = Pattern(pattern_name)
+        except ValueError:
+            available = ", ".join([p.value for p in Pattern])
+            return [TextContent(type="text", text=f"Error: Unknown pattern '{pattern_name}'. Available: {available}")]
+
+        # Get pattern info from the list
+        all_patterns = list_patterns()
+        info = next((p for p in all_patterns if p['id'] == pattern_name), None)
+        pattern_display = info['name'] if info else pattern_name
+
+        # Run the pattern
+        result = await run_pattern(pattern, question, rounds=rounds, branches=branches)
+
+        # Format output
+        output_parts = []
+        output_parts.append("=" * 60)
+        output_parts.append(f"PATTERN: {pattern_display}")
+        output_parts.append("=" * 60)
+        output_parts.append(f"\n**Question:** {question}\n")
+
+        if info:
+            output_parts.append(f"**Strategy:** {info['description']}\n")
+
+        # Display stages
+        stages = result.get("stages", [])
+        for i, stage in enumerate(stages, 1):
+            output_parts.append("-" * 60)
+            stage_name = stage.get("name", f"Stage {i}")
+            output_parts.append(f"**{stage_name}**")
+            output_parts.append("-" * 60)
+
+            # Handle different stage content types
+            if "responses" in stage:
+                for resp in stage["responses"]:
+                    role = resp.get("role", resp.get("model", "Unknown"))
+                    content = resp.get("response", resp.get("content", "No response"))
+                    output_parts.append(f"\n### {role}")
+                    output_parts.append(content)
+                    output_parts.append("")
+            elif "response" in stage:
+                output_parts.append(stage["response"])
+                output_parts.append("")
+            elif "branches" in stage:
+                for j, branch in enumerate(stage["branches"], 1):
+                    output_parts.append(f"\n**Branch {j}:**")
+                    output_parts.append(branch.get("response", branch.get("content", "No content")))
+                    output_parts.append("")
+            elif "content" in stage:
+                output_parts.append(stage["content"])
+                output_parts.append("")
+
+        # Final answer
+        if result.get("final_answer"):
+            output_parts.append("-" * 60)
+            output_parts.append("**FINAL ANSWER**")
+            output_parts.append("-" * 60)
+            output_parts.append(result["final_answer"])
+
+        # Metadata
+        if result.get("metadata"):
+            meta = result["metadata"]
+            output_parts.append("\n---")
+            if meta.get("consensus_rate"):
+                output_parts.append(f"*Consensus Rate: {meta['consensus_rate']:.0%}*")
+            if meta.get("winning_branch"):
+                output_parts.append(f"*Winning Branch: {meta['winning_branch']}*")
+            if meta.get("rounds_completed"):
+                output_parts.append(f"*Rounds Completed: {meta['rounds_completed']}*")
+
+        return [TextContent(type="text", text="\n".join(output_parts))]
+
+    except Exception as e:
+        import traceback
+        return [TextContent(type="text", text=f"Error running pattern: {str(e)}\n{traceback.format_exc()}")]
 
 
 async def main():
