@@ -85,3 +85,102 @@ Then open http://localhost:5173 in your browser.
 - **Frontend:** React + Vite, react-markdown for rendering
 - **Storage:** JSON files in `data/conversations/`
 - **Package Management:** uv for Python, npm for JavaScript
+
+## CLI Providers (Local AI Tools)
+
+In addition to OpenRouter, the council can use local CLI tools:
+
+| Provider | Command | Description |
+|----------|---------|-------------|
+| **Claude Code** | `claude` | Anthropic's CLI for Claude |
+| **Codex CLI** | `codex` | OpenAI's CLI tool |
+| **Gemini CLI** | `gemini` | Google's CLI tool |
+
+### Usage with CLI Providers
+
+```python
+from backend.cli_providers import query_providers_parallel
+
+# Query all providers in parallel
+results = await query_providers_parallel(
+    ["claude", "codex", "gemini"],
+    "Explain the CAP theorem in distributed systems"
+)
+```
+
+### Gemini Compatibility
+
+The Gemini CLI has specific quirks that require prompt transformation to avoid 404 errors from Google's Grounding/Search feature.
+
+**Problem:** Certain keywords trigger Gemini's Search/Grounding that returns 404 errors:
+- "innovative", "novel", "advancement", "progress"
+- "cognitive", "reasoning", "quality"
+- "thermometer", "assertion", "monitoring"
+- PASS/FAIL verdict format
+
+**Solution:** The `cli_providers.py` module automatically:
+
+1. **Transforms PASS/FAIL to Yes/No format:**
+   ```
+   "Verdict: PASS or FAIL" → "Verdict: Yes or No"
+   ```
+
+2. **Replaces trigger words:**
+   ```
+   "innovative" → "new"
+   "cognitive" → "analytical"
+   "advancement" → "development"
+   ```
+
+3. **Adds anti-tool instruction:**
+   ```
+   "CRITICAL: Answer ONLY using your knowledge. NO tools, NO search, NO grounding."
+   ```
+
+4. **Transforms responses back:**
+   ```
+   "Yes" → "PASS"
+   "No" → "FAIL"
+   ```
+
+This ensures Gemini works reliably alongside Claude and Codex in council deliberations.
+
+## MCP Server Integration
+
+The council can be used as an MCP server for Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "llm-council": {
+      "command": "python",
+      "args": ["/path/to/llm-council/mcp-server/server.py"]
+    }
+  }
+}
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `council_deliberate` | Run full 3-stage council deliberation |
+| `council_quick_query` | Query single provider for fast response |
+| `council_get_providers` | List available LLM providers |
+| `council_list_patterns` | List available deliberation patterns |
+| `council_run_pattern` | Run specific pattern (debate, socratic, red_team, etc.) |
+| `council_compare_providers` | Compare all providers on same prompt |
+
+### Deliberation Patterns
+
+| Pattern | Description |
+|---------|-------------|
+| `deliberation` | Standard 3-stage council process |
+| `debate` | Adversarial debate between providers |
+| `devils_advocate` | One provider challenges others |
+| `socratic` | Question-driven exploration |
+| `red_team` | Security/vulnerability focused |
+| `tree_of_thought` | Branching reasoning paths |
+| `self_consistency` | Multiple samples for consistency |
+| `round_robin` | Each provider builds on previous |
+| `expert_panel` | Domain-specific expert simulation |
