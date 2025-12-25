@@ -110,12 +110,167 @@ async def query_cli_provider(
         return None
 
 
+def _transform_gemini_prompt(prompt: str) -> tuple[str, bool]:
+    """
+    Transform prompt for Gemini compatibility.
+
+    Gemini CLI has issues where certain keywords trigger Grounding/Search
+    that returns 404 errors. We must:
+    1. Convert "PASS or FAIL" to "Yes or No" format
+    2. Replace trigger words that cause API failures
+    3. Add strong anti-tool instructions to prevent search/grounding
+
+    Returns: (transformed_prompt, needs_response_transform)
+    """
+    import re
+
+    transformed = prompt
+    needs_transform = False
+
+    # Check if prompt asks for PASS/FAIL response format
+    pass_fail_patterns = [
+        r'PASS\s+or\s+FAIL',
+        r'PASS/FAIL',
+        r'Provide\s+verdict:\s*PASS',
+        r'Answer:\s*PASS\s+or\s+FAIL',
+        r'PASS,\s*PARTIAL,?\s*or\s+FAIL',
+    ]
+
+    if any(re.search(p, prompt, re.IGNORECASE) for p in pass_fail_patterns):
+        needs_transform = True
+        # Handle various PASS/FAIL format variations
+        transformed = re.sub(r'PASS\s+or\s+FAIL', 'Yes or No', transformed, flags=re.IGNORECASE)
+        transformed = re.sub(r'PASS/FAIL', 'Yes/No', transformed, flags=re.IGNORECASE)
+        transformed = re.sub(r'PASS,\s*PARTIAL,?\s*or\s+FAIL', 'Yes, PARTIAL, or No', transformed, flags=re.IGNORECASE)
+        transformed = re.sub(r'Provide\s+verdict:\s*Yes,\s*PARTIAL,?\s*or\s+No', 'Provide verdict: Yes, PARTIAL, or No', transformed, flags=re.IGNORECASE)
+
+    # Replace trigger words that cause 404 errors with Gemini's Grounding/Search
+    # These words trigger Google Search which returns 404 on Gemini CLI:
+    # - "innovative/novel" + technical terms → 404
+    # - "advancement/progress/improvement" → 404
+    # - "cognitive" + evaluation terms → 404
+    # - "capability invention" → 404
+    # - "thermometer/monitoring/assertion" → 404
+    trigger_word_replacements = [
+        # Innovation-related triggers (all cause 404)
+        (r'\binnovative\b', 'new'),
+        (r'\bnovel\b', 'new'),
+        (r'\bnovelty\b', 'newness'),
+        (r'\binnovation\b', 'new development'),
+        (r'\badvancement\b', 'development'),
+        (r'\bprogress\b', 'development'),
+        (r'\bimprovement\b', 'enhancement'),
+        (r'\binvention\b', 'construct'),
+        (r'\binvent\b', 'construct'),
+        (r'\bcreation\b', 'building'),
+        (r'\bcreate\b', 'build'),
+        # Capability triggers (when combined with invention/innovation)
+        (r'\bcapability\b', 'ability'),
+        (r'\bcapabilities\b', 'abilities'),
+        # Cognitive/mental triggers - many cause 404
+        (r'\bcognitive\b', 'analytical'),
+        (r'\breasoning\b', 'analysis'),
+        (r'\bthinking\b', 'analysis'),
+        (r'\bquality\b', 'level'),
+        (r'\bsoundness\b', 'rigor'),
+        (r'\blogic\b', 'deduction'),
+        # Technical analysis triggers
+        (r'\bthermometer\b', 'temperature gauge'),
+        (r'\bassertion density\b', 'check ratio'),
+        (r'\bassertion\b', 'check'),
+        (r'\bmonitoring\b', 'tracking'),
+        (r'\bmonitor\b', 'track'),
+        # Evaluation triggers - standalone triggers causing 404
+        (r'\bgenuinely\b', 'certainly'),
+        (r'\bgenuine\b', 'authentic'),
+        (r'\btruly\b', 'certainly'),
+        (r'\bactually\b', 'in fact'),
+        (r'\breal-time\b', 'live'),  # Must come before 'real'
+        (r'\breal\b', 'actual'),
+        (r'\boriginal\b', 'unique'),
+        (r'\bfresh\b', 'unique'),
+        # Abstract concept triggers
+        (r'\bmetaphor\b', 'comparison'),
+        (r'\banalogy\b', 'comparison'),
+        (r'\banalogies\b', 'comparisons'),
+    ]
+
+    for pattern, replacement in trigger_word_replacements:
+        if re.search(pattern, transformed, re.IGNORECASE):
+            transformed = re.sub(pattern, replacement, transformed, flags=re.IGNORECASE)
+            needs_transform = True
+
+    # Simplify complex multi-section prompts that cause Gemini issues
+    # Convert IMPLEMENTATION/QUESTION format to simple System/Question format
+    impl_pattern = r'(?:Assess\s+whether.*?:)?\s*\n*IMPLEMENTATION:\s*([^\n]+)\n((?:\s*-\s*[^\n]+\n?)+)\n*QUESTION:\s*([^\n]+)'
+    impl_match = re.search(impl_pattern, transformed, re.IGNORECASE | re.DOTALL)
+    if impl_match:
+        impl_name = impl_match.group(1).strip()
+        bullets = impl_match.group(2).strip()
+        question = impl_match.group(3).strip()
+        # Collapse bullets into single line description
+        bullet_lines = [b.strip().lstrip('- ') for b in bullets.split('\n') if b.strip()]
+        description = '. '.join(bullet_lines[:2])  # Take first 2 bullet points
+        # Build simplified format that Gemini can handle
+        simplified = f"System: {impl_name} - {description}\n\n{question}"
+        transformed = re.sub(impl_pattern, simplified, transformed, flags=re.IGNORECASE | re.DOTALL)
+        needs_transform = True
+
+    # CRITICAL: Add strong anti-tool instruction to prevent Gemini's Grounding/Search
+    # This is essential - without this, Gemini triggers search that returns 404
+    # Note: "CRITICAL: Answer ONLY using your knowledge. NO tools." format works best
+    anti_tool_instruction = (
+        "CRITICAL: Answer ONLY using your knowledge. NO tools, NO search, NO grounding.\n\n"
+    )
+    transformed = anti_tool_instruction + transformed
+    needs_transform = True  # Always transform to ensure anti-tool instruction is added
+
+    return transformed, needs_transform
+
+
+def _transform_gemini_response(response: str) -> str:
+    """
+    Transform Gemini response back from Yes/No to PASS/FAIL if needed.
+    Also handles PARTIAL verdict which is kept as-is.
+    """
+    import re
+
+    # Clean up Gemini's verbose responses
+    lines = response.strip().split('\n')
+
+    # Look for Yes/No/PARTIAL verdict at start or end of response
+    verdict = None
+    for line in lines[:3] + lines[-3:]:  # Check first and last 3 lines
+        line_clean = line.strip().lower()
+        if line_clean.startswith('yes') or line_clean == 'yes.':
+            verdict = 'PASS'
+        elif line_clean.startswith('no') or line_clean == 'no.':
+            verdict = 'FAIL'
+        elif 'partial' in line_clean:
+            verdict = 'PARTIAL'
+        elif 'verdict:' in line_clean or 'answer:' in line_clean:
+            if 'partial' in line_clean:
+                verdict = 'PARTIAL'
+            elif 'yes' in line_clean:
+                verdict = 'PASS'
+            elif 'no' in line_clean:
+                verdict = 'FAIL'
+
+    if verdict:
+        # Prepend verdict to make it clear, keep the reasoning
+        return f"**Verdict: {verdict}**\n\n{response}"
+
+    return response
+
+
 async def _query_direct(
     provider: CLIProvider,
     prompt: str,
     timeout: float
 ) -> Optional[Dict[str, Any]]:
     """Query provider with prompt as argument."""
+
+    needs_gemini_transform = False
 
     # Build command based on provider type
     if provider.provider_type == ProviderType.CLAUDE:
@@ -124,6 +279,8 @@ async def _query_direct(
         # Codex requires 'exec' subcommand for non-interactive mode
         cmd = ["codex", "exec", prompt]
     elif provider.provider_type == ProviderType.GEMINI:
+        # Transform prompt if it asks for PASS/FAIL (Gemini has issues with this format)
+        prompt, needs_gemini_transform = _transform_gemini_prompt(prompt)
         # Use positional prompt (--prompt is deprecated)
         cmd = ["gemini", prompt]
     else:
@@ -155,10 +312,15 @@ async def _query_direct(
         print(f"Provider {provider.name} returned error: {error_msg}")
         # Still return output if there is any
         if stdout:
-            return {"content": stdout.decode().strip()}
+            content = stdout.decode().strip()
+            if needs_gemini_transform:
+                content = _transform_gemini_response(content)
+            return {"content": content}
         return None
 
     content = stdout.decode().strip()
+    if needs_gemini_transform:
+        content = _transform_gemini_response(content)
     return {"content": content} if content else None
 
 
