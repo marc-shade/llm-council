@@ -18,6 +18,7 @@ class ProviderType(Enum):
     CLAUDE = "claude"
     CODEX = "codex"
     GEMINI = "gemini"
+    OLLAMA = "ollama"
 
 
 @dataclass
@@ -69,21 +70,207 @@ PROVIDERS = {
         args_template=["-p", "{prompt}"],
         timeout=180.0
     ),
+    "ollama": CLIProvider(
+        name="ollama",
+        provider_type=ProviderType.OLLAMA,
+        display_name="Ollama (Local)",
+        command="ollama",
+        args_template=["run", "{model}", "{prompt}"],
+        timeout=300.0  # Local models may need more time
+    ),
 }
+
+# Default models - will be updated dynamically where possible
+DEFAULT_MODELS = {
+    "claude": "claude-sonnet-4-20250514",  # Safe default
+    "codex": "o3",  # Deprecated - using ollama instead
+    "gemini": "gemini-2.5-pro",
+    "ollama": "gpt-oss:120b-cloud",  # OpenAI-compatible model via Ollama Cloud
+}
+
+# Model cache - populated dynamically
+_model_cache: Dict[str, List[Dict[str, str]]] = {}
+_cache_timestamp: Dict[str, float] = {}
+_CACHE_TTL = 300  # 5 minutes
+
+
+async def _fetch_ollama_models() -> List[Dict[str, str]]:
+    """Dynamically fetch installed Ollama models via `ollama list`."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ollama", "list",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+
+        models = []
+        lines = stdout.decode().strip().split('\n')
+        for line in lines[1:]:  # Skip header line
+            if line.strip():
+                parts = line.split()
+                if parts:
+                    model_id = parts[0]
+                    # Clean up model name for display
+                    name = model_id.replace(':', ' ').replace('-', ' ').title()
+                    models.append({"id": model_id, "name": name})
+
+        return models if models else [{"id": "llama3.2:latest", "name": "Llama 3.2 (default)"}]
+    except Exception as e:
+        print(f"Failed to fetch Ollama models: {e}")
+        return [{"id": "llama3.2:latest", "name": "Llama 3.2 (default)"}]
+
+
+async def _fetch_claude_models() -> List[Dict[str, str]]:
+    """Fetch Claude models from API."""
+    try:
+        # Try to get models from Anthropic API
+        import httpx
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+                    timeout=10.0
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = []
+                    for m in data.get("data", []):
+                        model_id = m.get("id", "")
+                        # Filter to chat models only
+                        if "claude" in model_id.lower():
+                            name = model_id.replace("-", " ").replace("claude", "Claude").title()
+                            models.append({"id": model_id, "name": name})
+                    if models:
+                        return sorted(models, key=lambda x: x["id"], reverse=True)[:6]
+    except Exception as e:
+        print(f"Failed to fetch Claude models from API: {e}")
+
+    # Fallback - these are the current models as of the API
+    return [
+        {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+        {"id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
+    ]
+
+
+async def _fetch_openai_models() -> List[Dict[str, str]]:
+    """Fetch OpenAI models from API."""
+    try:
+        import httpx
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=10.0
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = []
+                    # Filter to relevant models
+                    relevant = ["gpt-4", "gpt-5", "o1", "o3", "o4"]
+                    for m in data.get("data", []):
+                        model_id = m.get("id", "")
+                        if any(r in model_id.lower() for r in relevant):
+                            name = model_id.replace("-", " ").upper() if model_id.startswith("o") else model_id.replace("-", " ").title()
+                            models.append({"id": model_id, "name": name})
+                    if models:
+                        return sorted(models, key=lambda x: x["id"], reverse=True)[:8]
+    except Exception as e:
+        print(f"Failed to fetch OpenAI models from API: {e}")
+
+    # Fallback
+    return [
+        {"id": "o3", "name": "o3"},
+        {"id": "gpt-4o", "name": "GPT-4o"},
+    ]
+
+
+async def _fetch_gemini_models() -> List[Dict[str, str]]:
+    """Fetch Gemini models from API."""
+    try:
+        import httpx
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if api_key:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"https://generativelanguage.googleapis.com/v1/models?key={api_key}",
+                    timeout=10.0
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = []
+                    for m in data.get("models", []):
+                        model_id = m.get("name", "").replace("models/", "")
+                        if "gemini" in model_id.lower():
+                            display = m.get("displayName", model_id)
+                            models.append({"id": model_id, "name": display})
+                    if models:
+                        return sorted(models, key=lambda x: x["id"], reverse=True)[:6]
+    except Exception as e:
+        print(f"Failed to fetch Gemini models from API: {e}")
+
+    # Fallback
+    return [
+        {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+        {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
+    ]
+
+
+async def get_models_for_provider(provider: str, force_refresh: bool = False) -> List[Dict[str, str]]:
+    """
+    Get available models for a provider, fetching dynamically where possible.
+    Results are cached for 5 minutes.
+    """
+    import time
+
+    now = time.time()
+    if not force_refresh and provider in _model_cache:
+        if now - _cache_timestamp.get(provider, 0) < _CACHE_TTL:
+            return _model_cache[provider]
+
+    # Fetch fresh models
+    if provider == "ollama":
+        models = await _fetch_ollama_models()
+    elif provider == "claude":
+        models = await _fetch_claude_models()
+    elif provider == "codex":
+        models = await _fetch_openai_models()
+    elif provider == "gemini":
+        models = await _fetch_gemini_models()
+    else:
+        models = []
+
+    # Update cache
+    _model_cache[provider] = models
+    _cache_timestamp[provider] = now
+
+    # Update default model for ollama if not set
+    if provider == "ollama" and models and DEFAULT_MODELS.get("ollama") is None:
+        DEFAULT_MODELS["ollama"] = models[0]["id"]
+
+    return models
 
 
 async def query_cli_provider(
     provider_name: str,
     prompt: str,
-    timeout: Optional[float] = None
+    timeout: Optional[float] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query a single CLI provider asynchronously.
 
     Args:
-        provider_name: Name of the provider (claude, codex, gemini)
+        provider_name: Name of the provider (claude, codex, gemini, ollama)
         prompt: The prompt to send
         timeout: Optional timeout override
+        model: Optional specific model to use (defaults to provider's default)
+        temperature: Optional temperature (0.0-2.0) for response entropy/creativity
 
     Returns:
         Response dict with 'content' key, or None if failed
@@ -94,13 +281,14 @@ async def query_cli_provider(
         return None
 
     effective_timeout = timeout or provider.timeout
+    effective_model = model or DEFAULT_MODELS.get(provider_name)
 
     try:
         # For long prompts, use a temp file
         if len(prompt) > 4000:
-            return await _query_with_file(provider, prompt, effective_timeout)
+            return await _query_with_file(provider, prompt, effective_timeout, effective_model, temperature)
         else:
-            return await _query_direct(provider, prompt, effective_timeout)
+            return await _query_direct(provider, prompt, effective_timeout, effective_model, temperature)
 
     except asyncio.TimeoutError:
         print(f"Timeout querying {provider_name} after {effective_timeout}s")
@@ -266,23 +454,110 @@ def _transform_gemini_response(response: str) -> str:
 async def _query_direct(
     provider: CLIProvider,
     prompt: str,
-    timeout: float
+    timeout: float,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
-    """Query provider with prompt as argument."""
+    """Query provider with prompt as argument.
+
+    Args:
+        provider: The CLI provider to query
+        prompt: The prompt text
+        timeout: Request timeout in seconds
+        model: Optional model override
+        temperature: Optional temperature (0.0-2.0) for entropy control
+    """
 
     needs_gemini_transform = False
 
     # Build command based on provider type
     if provider.provider_type == ProviderType.CLAUDE:
-        cmd = ["claude", "-p", prompt, "--print"]
+        # Claude Code CLI with optional model specification
+        if model:
+            cmd = ["claude", "-p", prompt, "--print", "--model", model]
+        else:
+            cmd = ["claude", "-p", prompt, "--print"]
     elif provider.provider_type == ProviderType.CODEX:
         # Codex requires 'exec' subcommand for non-interactive mode
-        cmd = ["codex", "exec", prompt]
+        cmd = ["codex", "exec"]
+        if model:
+            cmd.extend(["--model", model])
+        # Add temperature via config override (OpenAI API parameter)
+        if temperature is not None:
+            cmd.extend(["-c", f"temperature={temperature}"])
+            print(f"Codex using temperature={temperature} for entropy control")
+        cmd.append(prompt)
     elif provider.provider_type == ProviderType.GEMINI:
         # Transform prompt if it asks for PASS/FAIL (Gemini has issues with this format)
         prompt, needs_gemini_transform = _transform_gemini_prompt(prompt)
-        # Use positional prompt (--prompt is deprecated)
-        cmd = ["gemini", prompt]
+        # Gemini CLI: -p flag required for non-interactive (headless) mode
+        if model:
+            cmd = ["gemini", "-p", prompt, "-m", model]
+        else:
+            cmd = ["gemini", "-p", prompt]
+    elif provider.provider_type == ProviderType.OLLAMA:
+        # Use Ollama REST API (more reliable than CLI)
+        import httpx
+        effective_model = model or DEFAULT_MODELS.get("ollama", "llama3.2:latest")
+        ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                # Quick health check first (2 second timeout)
+                try:
+                    health = await client.get(f"{ollama_url}/", timeout=2.0)
+                    if health.status_code != 200:
+                        print(f"Ollama service not responding at {ollama_url}")
+                        return {"content": f"[Ollama Error] Service not available at {ollama_url}. Please ensure Ollama is running."}
+                except Exception:
+                    print(f"Ollama service not reachable at {ollama_url}")
+                    return {"content": f"[Ollama Error] Cannot connect to {ollama_url}. Please ensure Ollama is running."}
+
+                # Check if model is loaded (quick check)
+                try:
+                    ps_resp = await client.get(f"{ollama_url}/api/ps", timeout=2.0)
+                    if ps_resp.status_code == 200:
+                        loaded = ps_resp.json().get("models", [])
+                        loaded_names = [m.get("name", "") for m in loaded]
+                        if effective_model not in loaded_names:
+                            print(f"Warning: Model {effective_model} not loaded. Currently loaded: {loaded_names}. This may take time.")
+                except Exception:
+                    pass  # Non-critical check
+
+                # Make the actual request with optional temperature
+                request_body = {
+                    "model": effective_model,
+                    "prompt": prompt,
+                    "stream": False  # Get complete response
+                }
+                # Add temperature if specified (Ollama supports 0.0-2.0)
+                if temperature is not None:
+                    request_body["options"] = {"temperature": temperature}
+                    print(f"Ollama using temperature={temperature} for entropy control")
+
+                resp = await client.post(
+                    f"{ollama_url}/api/generate",
+                    json=request_body,
+                    timeout=timeout
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = data.get("response", "").strip()
+                    return {"content": content} if content else {"content": "[Ollama] Empty response received"}
+                else:
+                    error_msg = f"Status {resp.status_code}: {resp.text[:200]}"
+                    print(f"Ollama API error: {error_msg}")
+                    return {"content": f"[Ollama Error] {error_msg}"}
+        except httpx.TimeoutException:
+            print(f"Ollama request timed out after {timeout}s for model {effective_model}")
+            return {"content": f"[Ollama Error] Request timed out after {timeout}s. Model {effective_model} may be loading or busy."}
+        except httpx.ConnectError:
+            print(f"Cannot connect to Ollama at {ollama_url}")
+            return {"content": f"[Ollama Error] Cannot connect to {ollama_url}. Is Ollama running?"}
+        except Exception as e:
+            print(f"Ollama error: {e}")
+            return {"content": f"[Ollama Error] {str(e)}"}
     else:
         return None
 
@@ -327,7 +602,9 @@ async def _query_direct(
 async def _query_with_file(
     provider: CLIProvider,
     prompt: str,
-    timeout: float
+    timeout: float,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
     """Query provider using a temp file for long prompts."""
 
@@ -338,8 +615,11 @@ async def _query_with_file(
     try:
         # Use file-based input
         if provider.provider_type == ProviderType.CLAUDE:
-            # Claude can read from stdin
-            cmd = ["claude", "--print"]
+            # Claude can read from stdin (note: Claude CLI doesn't support temperature directly)
+            if model:
+                cmd = ["claude", "--print", "--model", model]
+            else:
+                cmd = ["claude", "--print"]
 
             # Set up environment - empty API key to force OAuth/subscription auth
             env = os.environ.copy()
@@ -359,7 +639,7 @@ async def _query_with_file(
             )
         else:
             # For others, pass prompt directly (they handle it)
-            return await _query_direct(provider, prompt, timeout)
+            return await _query_direct(provider, prompt, timeout, model, temperature)
 
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
@@ -405,24 +685,28 @@ async def query_providers_parallel(
 
 # Compatibility layer - matches openrouter.py interface
 async def query_model(
-    model: str,
+    provider: str,
     messages: List[Dict[str, str]],
-    timeout: float = 120.0
+    timeout: float = 120.0,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query a model (CLI provider) - compatible with openrouter.py interface.
 
     Args:
-        model: Provider name (claude, codex, gemini)
+        provider: Provider name (claude, codex, gemini, ollama)
         messages: List of message dicts with 'role' and 'content'
         timeout: Request timeout in seconds
+        model: Optional specific model to use (e.g., "claude-sonnet-4-20250514")
+        temperature: Optional temperature (0.0-2.0) for entropy/creativity control
 
     Returns:
         Response dict with 'content' key, or None if failed
     """
     # Convert messages to a single prompt
     prompt = _messages_to_prompt(messages)
-    return await query_cli_provider(model, prompt, timeout)
+    return await query_cli_provider(provider, prompt, timeout, model, temperature)
 
 
 async def query_models_parallel(
@@ -475,6 +759,25 @@ def get_provider_info(name: str) -> Optional[Dict[str, Any]]:
         "type": provider.provider_type.value,
         "timeout": provider.timeout
     }
+
+
+async def get_providers_with_models() -> List[Dict[str, Any]]:
+    """Get all providers with their available models for frontend consumption.
+
+    Models are fetched dynamically from provider APIs (with 5-minute caching).
+    """
+    result = []
+    for name, provider in PROVIDERS.items():
+        # Dynamically fetch models from provider APIs
+        models = await get_models_for_provider(name)
+        default_model = DEFAULT_MODELS.get(name)
+        result.append({
+            "id": name,
+            "name": provider.display_name,
+            "default_model": default_model,
+            "models": models,
+        })
+    return result
 
 
 # Quick test

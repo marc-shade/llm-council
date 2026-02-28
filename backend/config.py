@@ -1,6 +1,7 @@
 """Configuration for the LLM Council - CLI Provider Edition.
 
-This version uses local CLI tools (Claude Code, Codex, Gemini) instead of OpenRouter.
+This version uses local CLI tools (Claude Code, Gemini) and Ollama cloud models
+instead of OpenRouter.
 """
 
 import os
@@ -15,15 +16,15 @@ PROVIDER_MODE = os.getenv("PROVIDER_MODE", "cli")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # CLI Council Configuration
-# These are the local CLI tools that form the council
+# Claude Code + Gemini CLI + Ollama cloud (gpt-oss via ollama.com)
 CLI_COUNCIL_MODELS = [
     "claude",   # Claude Code CLI (Anthropic)
-    "codex",    # Codex CLI (OpenAI)
+    "ollama",   # Ollama Cloud - gpt-oss:120b-cloud (OpenAI-compatible)
     "gemini",   # Gemini CLI (Google)
 ]
 
 # CLI Chairman model - synthesizes final response
-CLI_CHAIRMAN_MODEL = "codex"  # Codex as chairman (most reliable)
+CLI_CHAIRMAN_MODEL = "gemini"  # Gemini as chairman
 
 # OpenRouter Council Configuration (legacy/alternative)
 OPENROUTER_COUNCIL_MODELS = [
@@ -52,13 +53,13 @@ DATA_DIR = "data/conversations"
 # Display names for CLI providers
 PROVIDER_DISPLAY_NAMES = {
     "claude": "Claude Code (Anthropic)",
-    "codex": "Codex CLI (OpenAI)",
+    "ollama": "GPT-OSS 120B (Ollama Cloud)",
     "gemini": "Gemini CLI (Google)",
 }
 
 # Timeouts for each provider (CLI tools can be slower)
 PROVIDER_TIMEOUTS = {
     "claude": 180.0,
-    "codex": 180.0,
+    "ollama": 120.0,
     "gemini": 180.0,
 }

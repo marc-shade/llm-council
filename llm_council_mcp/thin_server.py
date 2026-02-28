@@ -52,7 +52,7 @@ async def list_tools() -> List[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "provider": {"type": "string", "enum": ["claude", "codex", "gemini"]},
+                    "provider": {"type": "string", "enum": ["claude", "ollama", "gemini"]},
                     "prompt": {"type": "string", "description": "Prompt to send"},
                     "timeout": {"type": "number", "description": "Timeout in seconds", "default": 60}
                 },
