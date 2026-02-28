@@ -19,6 +19,7 @@ class ProviderType(Enum):
     CODEX = "codex"
     GEMINI = "gemini"
     OLLAMA = "ollama"
+    LLAMA_SERVER = "llama_server"
 
 
 @dataclass
@@ -78,6 +79,14 @@ PROVIDERS = {
         args_template=["run", "{model}", "{prompt}"],
         timeout=300.0  # Local models may need more time
     ),
+    "llama_server": CLIProvider(
+        name="llama_server",
+        provider_type=ProviderType.LLAMA_SERVER,
+        display_name="llama-server (Local)",
+        command="llama-server",
+        args_template=[],
+        timeout=300.0
+    ),
 }
 
 # Default models - will be updated dynamically where possible
@@ -86,6 +95,7 @@ DEFAULT_MODELS = {
     "codex": "o3",  # Deprecated - using ollama instead
     "gemini": "gemini-2.5-pro",
     "ollama": "gpt-oss:120b-cloud",  # OpenAI-compatible model via Ollama Cloud
+    "llama_server": "qwen2.5-coder",  # Default model loaded in llama-server
 }
 
 # Model cache - populated dynamically
@@ -220,6 +230,27 @@ async def _fetch_gemini_models() -> List[Dict[str, str]]:
     ]
 
 
+async def _fetch_llama_server_models() -> List[Dict[str, str]]:
+    """Fetch models from llama-server's OpenAI-compatible /v1/models endpoint."""
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.get("http://127.0.0.1:8090/v1/models", timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = []
+                for m in data.get("data", []):
+                    model_id = m.get("id", "")
+                    if model_id:
+                        models.append({"id": model_id, "name": model_id})
+                if models:
+                    return models
+    except Exception as e:
+        print(f"Failed to fetch llama-server models: {e}")
+
+    return [{"id": "qwen2.5-coder", "name": "Qwen 2.5 Coder 14B (default)"}]
+
+
 async def get_models_for_provider(provider: str, force_refresh: bool = False) -> List[Dict[str, str]]:
     """
     Get available models for a provider, fetching dynamically where possible.
@@ -241,6 +272,8 @@ async def get_models_for_provider(provider: str, force_refresh: bool = False) ->
         models = await _fetch_openai_models()
     elif provider == "gemini":
         models = await _fetch_gemini_models()
+    elif provider == "llama_server":
+        models = await _fetch_llama_server_models()
     else:
         models = []
 
@@ -495,6 +528,48 @@ async def _query_direct(
             cmd = ["gemini", "-p", prompt, "-m", model]
         else:
             cmd = ["gemini", "-p", prompt]
+    elif provider.provider_type == ProviderType.LLAMA_SERVER:
+        # Use llama-server OpenAI-compatible API
+        import httpx
+        effective_model = model or DEFAULT_MODELS.get("llama_server", "qwen2.5-coder")
+        base_url = "http://127.0.0.1:8090"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                request_body = {
+                    "model": effective_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if temperature is not None:
+                    request_body["temperature"] = temperature
+
+                resp = await client.post(
+                    f"{base_url}/v1/chat/completions",
+                    json=request_body,
+                    timeout=timeout
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        content = choices[0].get("message", {}).get("content", "").strip()
+                        return {"content": content} if content else {"content": "[llama-server] Empty response"}
+                    return {"content": "[llama-server] No choices in response"}
+                else:
+                    error_msg = f"Status {resp.status_code}: {resp.text[:200]}"
+                    print(f"llama-server API error: {error_msg}")
+                    return {"content": f"[llama-server Error] {error_msg}"}
+        except httpx.ConnectError:
+            print(f"Cannot connect to llama-server at {base_url}")
+            return {"content": f"[llama-server Error] Cannot connect to {base_url}. Is llama-server running?"}
+        except httpx.TimeoutException:
+            print(f"llama-server request timed out after {timeout}s")
+            return {"content": f"[llama-server Error] Request timed out after {timeout}s"}
+        except Exception as e:
+            print(f"llama-server error: {e}")
+            return {"content": f"[llama-server Error] {str(e)}"}
+
     elif provider.provider_type == ProviderType.OLLAMA:
         # Use Ollama REST API (more reliable than CLI)
         import httpx
