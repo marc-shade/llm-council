@@ -17,10 +17,17 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # CLI Council Configuration
 # Claude Code + Gemini CLI + Ollama cloud (gpt-oss via ollama.com)
+# Reordered 2026-06-03: the claude CLI subprocess reliably fails ("claude failed
+# to respond") when spawned nested from this backend, so it is removed from the
+# active council until that nested-invocation is fixed separately. red_team uses
+# models[0]=blue and models[1]=red plus CLI_CHAIRMAN_MODEL, so positions 0/1 and
+# the chairman must be VERIFIED-working providers (gemini, ollama). codex re-wired
+# to the subprocess form (cli_providers.py) and added back as the OpenAI seat.
 CLI_COUNCIL_MODELS = [
-    "claude",        # Claude Code CLI (Anthropic)
-    "ollama",        # Ollama Cloud - gpt-oss:120b-cloud (OpenAI-compatible)
-    "gemini",        # Gemini CLI (Google)
+    "gemini",  # Gemini CLI (Google) - blue team / chairman (verified working 2026-06-03)
+    "ollama",  # Ollama Cloud gpt-oss:120b-cloud (OpenAI-compat) - red team (verified)
+    "codex",  # Codex CLI (OpenAI gpt-5.5) - re-wired 2026-06-03 to subprocess form
+    "claude",  # Claude Code (Anthropic) - restored 2026-06-03 after binary-path fix (was off PATH under launchd)
     "llama_server",  # llama-server (local llama.cpp, qwen2.5-coder-14b)
 ]
 

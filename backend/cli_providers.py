@@ -6,15 +6,50 @@ that can work together in a council configuration.
 
 import asyncio
 import os
+import shutil
 import tempfile
-import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
 
+# Binary resolution (added 2026-06-03). The llm-council backend often runs under
+# launchd, whose PATH does NOT include the dirs where these CLIs live: `claude`
+# ships in ~/.local/bin and the cmux app bundle, neither on the launchd PATH, so
+# spawning the bare name "claude" fails with FileNotFoundError -- surfaced as
+# "claude failed to respond". gemini/codex happen to be on /opt/homebrew/bin so
+# they worked. Resolve every CLI to an absolute path so invocation is
+# PATH-independent regardless of how the backend was launched.
+_BIN_CANDIDATES = {
+    "claude": [
+        os.path.expanduser("~/.local/bin/claude"),
+        "/Applications/cmux.app/Contents/Resources/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ],
+    "codex": ["/opt/homebrew/bin/codex", os.path.expanduser("~/.local/bin/codex")],
+    "gemini": ["/opt/homebrew/bin/gemini", os.path.expanduser("~/.local/bin/gemini")],
+}
+
+
+def _resolve_bin(name: str) -> str:
+    """Resolve a CLI binary to an absolute path; fall back to the bare name."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for cand in _BIN_CANDIDATES.get(name, []):
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
+            return cand
+    return name
+
+
+_CLAUDE_BIN = _resolve_bin("claude")
+_CODEX_BIN = _resolve_bin("codex")
+_GEMINI_BIN = _resolve_bin("gemini")
+
+
 class ProviderType(Enum):
     """Supported CLI providers."""
+
     CLAUDE = "claude"
     CODEX = "codex"
     GEMINI = "gemini"
@@ -25,6 +60,7 @@ class ProviderType(Enum):
 @dataclass
 class CLIProvider:
     """Configuration for a CLI-based LLM provider."""
+
     name: str
     provider_type: ProviderType
     display_name: str
@@ -32,7 +68,9 @@ class CLIProvider:
     args_template: List[str]
     timeout: float = 120.0
 
-    def get_command_args(self, prompt: str, prompt_file: Optional[str] = None) -> List[str]:
+    def get_command_args(
+        self, prompt: str, prompt_file: Optional[str] = None
+    ) -> List[str]:
         """Build command arguments for the provider."""
         args = [self.command]
         for arg in self.args_template:
@@ -53,15 +91,15 @@ PROVIDERS = {
         display_name="Claude Code (Anthropic)",
         command="claude",
         args_template=["-p", "{prompt}", "--print"],
-        timeout=180.0
+        timeout=180.0,
     ),
     "codex": CLIProvider(
         name="codex",
         provider_type=ProviderType.CODEX,
-        display_name="Codex CLI (OpenAI)",
+        display_name="OpenAI API (GPT)",
         command="codex",
         args_template=["{prompt}"],
-        timeout=180.0
+        timeout=300.0,
     ),
     "gemini": CLIProvider(
         name="gemini",
@@ -69,7 +107,7 @@ PROVIDERS = {
         display_name="Gemini CLI (Google)",
         command="gemini",
         args_template=["-p", "{prompt}"],
-        timeout=180.0
+        timeout=180.0,
     ),
     "ollama": CLIProvider(
         name="ollama",
@@ -77,7 +115,7 @@ PROVIDERS = {
         display_name="Ollama (Local)",
         command="ollama",
         args_template=["run", "{model}", "{prompt}"],
-        timeout=300.0  # Local models may need more time
+        timeout=300.0,  # Local models may need more time
     ),
     "llama_server": CLIProvider(
         name="llama_server",
@@ -85,14 +123,14 @@ PROVIDERS = {
         display_name="llama-server (Local)",
         command="llama-server",
         args_template=[],
-        timeout=300.0
+        timeout=300.0,
     ),
 }
 
 # Default models - will be updated dynamically where possible
 DEFAULT_MODELS = {
     "claude": "claude-sonnet-4-20250514",  # Safe default
-    "codex": "o3",  # Deprecated - using ollama instead
+    "codex": "gpt-5.5",  # gpt-5.5 (ChatGPT Pro). Subprocess form (codex exec, stdin /dev/null), not tmux.
     "gemini": "gemini-2.5-pro",
     "ollama": "gpt-oss:120b-cloud",  # OpenAI-compatible model via Ollama Cloud
     "llama_server": "qwen2.5-coder",  # Default model loaded in llama-server
@@ -108,24 +146,29 @@ async def _fetch_ollama_models() -> List[Dict[str, str]]:
     """Dynamically fetch installed Ollama models via `ollama list`."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ollama", "list",
+            "ollama",
+            "list",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
 
         models = []
-        lines = stdout.decode().strip().split('\n')
+        lines = stdout.decode().strip().split("\n")
         for line in lines[1:]:  # Skip header line
             if line.strip():
                 parts = line.split()
                 if parts:
                     model_id = parts[0]
                     # Clean up model name for display
-                    name = model_id.replace(':', ' ').replace('-', ' ').title()
+                    name = model_id.replace(":", " ").replace("-", " ").title()
                     models.append({"id": model_id, "name": name})
 
-        return models if models else [{"id": "llama3.2:latest", "name": "Llama 3.2 (default)"}]
+        return (
+            models
+            if models
+            else [{"id": "llama3.2:latest", "name": "Llama 3.2 (default)"}]
+        )
     except Exception as e:
         print(f"Failed to fetch Ollama models: {e}")
         return [{"id": "llama3.2:latest", "name": "Llama 3.2 (default)"}]
@@ -136,13 +179,14 @@ async def _fetch_claude_models() -> List[Dict[str, str]]:
     try:
         # Try to get models from Anthropic API
         import httpx
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if api_key:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     "https://api.anthropic.com/v1/models",
                     headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -151,7 +195,11 @@ async def _fetch_claude_models() -> List[Dict[str, str]]:
                         model_id = m.get("id", "")
                         # Filter to chat models only
                         if "claude" in model_id.lower():
-                            name = model_id.replace("-", " ").replace("claude", "Claude").title()
+                            name = (
+                                model_id.replace("-", " ")
+                                .replace("claude", "Claude")
+                                .title()
+                            )
                             models.append({"id": model_id, "name": name})
                     if models:
                         return sorted(models, key=lambda x: x["id"], reverse=True)[:6]
@@ -169,13 +217,14 @@ async def _fetch_openai_models() -> List[Dict[str, str]]:
     """Fetch OpenAI models from API."""
     try:
         import httpx
+
         api_key = os.environ.get("OPENAI_API_KEY")
         if api_key:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     "https://api.openai.com/v1/models",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -185,7 +234,11 @@ async def _fetch_openai_models() -> List[Dict[str, str]]:
                     for m in data.get("data", []):
                         model_id = m.get("id", "")
                         if any(r in model_id.lower() for r in relevant):
-                            name = model_id.replace("-", " ").upper() if model_id.startswith("o") else model_id.replace("-", " ").title()
+                            name = (
+                                model_id.replace("-", " ").upper()
+                                if model_id.startswith("o")
+                                else model_id.replace("-", " ").title()
+                            )
                             models.append({"id": model_id, "name": name})
                     if models:
                         return sorted(models, key=lambda x: x["id"], reverse=True)[:8]
@@ -203,12 +256,13 @@ async def _fetch_gemini_models() -> List[Dict[str, str]]:
     """Fetch Gemini models from API."""
     try:
         import httpx
+
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         if api_key:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     f"https://generativelanguage.googleapis.com/v1/models?key={api_key}",
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -234,6 +288,7 @@ async def _fetch_llama_server_models() -> List[Dict[str, str]]:
     """Fetch models from llama-server's OpenAI-compatible /v1/models endpoint."""
     try:
         import httpx
+
         async with httpx.AsyncClient() as client:
             resp = await client.get("http://127.0.0.1:8090/v1/models", timeout=5.0)
             if resp.status_code == 200:
@@ -251,7 +306,9 @@ async def _fetch_llama_server_models() -> List[Dict[str, str]]:
     return [{"id": "qwen2.5-coder", "name": "Qwen 2.5 Coder 14B (default)"}]
 
 
-async def get_models_for_provider(provider: str, force_refresh: bool = False) -> List[Dict[str, str]]:
+async def get_models_for_provider(
+    provider: str, force_refresh: bool = False
+) -> List[Dict[str, str]]:
     """
     Get available models for a provider, fetching dynamically where possible.
     Results are cached for 5 minutes.
@@ -293,7 +350,7 @@ async def query_cli_provider(
     prompt: str,
     timeout: Optional[float] = None,
     model: Optional[str] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Query a single CLI provider asynchronously.
@@ -319,9 +376,13 @@ async def query_cli_provider(
     try:
         # For long prompts, use a temp file
         if len(prompt) > 4000:
-            return await _query_with_file(provider, prompt, effective_timeout, effective_model, temperature)
+            return await _query_with_file(
+                provider, prompt, effective_timeout, effective_model, temperature
+            )
         else:
-            return await _query_direct(provider, prompt, effective_timeout, effective_model, temperature)
+            return await _query_direct(
+                provider, prompt, effective_timeout, effective_model, temperature
+            )
 
     except asyncio.TimeoutError:
         print(f"Timeout querying {provider_name} after {effective_timeout}s")
@@ -350,20 +411,32 @@ def _transform_gemini_prompt(prompt: str) -> tuple[str, bool]:
 
     # Check if prompt asks for PASS/FAIL response format
     pass_fail_patterns = [
-        r'PASS\s+or\s+FAIL',
-        r'PASS/FAIL',
-        r'Provide\s+verdict:\s*PASS',
-        r'Answer:\s*PASS\s+or\s+FAIL',
-        r'PASS,\s*PARTIAL,?\s*or\s+FAIL',
+        r"PASS\s+or\s+FAIL",
+        r"PASS/FAIL",
+        r"Provide\s+verdict:\s*PASS",
+        r"Answer:\s*PASS\s+or\s+FAIL",
+        r"PASS,\s*PARTIAL,?\s*or\s+FAIL",
     ]
 
     if any(re.search(p, prompt, re.IGNORECASE) for p in pass_fail_patterns):
         needs_transform = True
         # Handle various PASS/FAIL format variations
-        transformed = re.sub(r'PASS\s+or\s+FAIL', 'Yes or No', transformed, flags=re.IGNORECASE)
-        transformed = re.sub(r'PASS/FAIL', 'Yes/No', transformed, flags=re.IGNORECASE)
-        transformed = re.sub(r'PASS,\s*PARTIAL,?\s*or\s+FAIL', 'Yes, PARTIAL, or No', transformed, flags=re.IGNORECASE)
-        transformed = re.sub(r'Provide\s+verdict:\s*Yes,\s*PARTIAL,?\s*or\s+No', 'Provide verdict: Yes, PARTIAL, or No', transformed, flags=re.IGNORECASE)
+        transformed = re.sub(
+            r"PASS\s+or\s+FAIL", "Yes or No", transformed, flags=re.IGNORECASE
+        )
+        transformed = re.sub(r"PASS/FAIL", "Yes/No", transformed, flags=re.IGNORECASE)
+        transformed = re.sub(
+            r"PASS,\s*PARTIAL,?\s*or\s+FAIL",
+            "Yes, PARTIAL, or No",
+            transformed,
+            flags=re.IGNORECASE,
+        )
+        transformed = re.sub(
+            r"Provide\s+verdict:\s*Yes,\s*PARTIAL,?\s*or\s+No",
+            "Provide verdict: Yes, PARTIAL, or No",
+            transformed,
+            flags=re.IGNORECASE,
+        )
 
     # Replace trigger words that cause 404 errors with Gemini's Grounding/Search
     # These words trigger Google Search which returns 404 on Gemini CLI:
@@ -374,46 +447,46 @@ def _transform_gemini_prompt(prompt: str) -> tuple[str, bool]:
     # - "thermometer/monitoring/assertion" → 404
     trigger_word_replacements = [
         # Innovation-related triggers (all cause 404)
-        (r'\binnovative\b', 'new'),
-        (r'\bnovel\b', 'new'),
-        (r'\bnovelty\b', 'newness'),
-        (r'\binnovation\b', 'new development'),
-        (r'\badvancement\b', 'development'),
-        (r'\bprogress\b', 'development'),
-        (r'\bimprovement\b', 'enhancement'),
-        (r'\binvention\b', 'construct'),
-        (r'\binvent\b', 'construct'),
-        (r'\bcreation\b', 'building'),
-        (r'\bcreate\b', 'build'),
+        (r"\binnovative\b", "new"),
+        (r"\bnovel\b", "new"),
+        (r"\bnovelty\b", "newness"),
+        (r"\binnovation\b", "new development"),
+        (r"\badvancement\b", "development"),
+        (r"\bprogress\b", "development"),
+        (r"\bimprovement\b", "enhancement"),
+        (r"\binvention\b", "construct"),
+        (r"\binvent\b", "construct"),
+        (r"\bcreation\b", "building"),
+        (r"\bcreate\b", "build"),
         # Capability triggers (when combined with invention/innovation)
-        (r'\bcapability\b', 'ability'),
-        (r'\bcapabilities\b', 'abilities'),
+        (r"\bcapability\b", "ability"),
+        (r"\bcapabilities\b", "abilities"),
         # Cognitive/mental triggers - many cause 404
-        (r'\bcognitive\b', 'analytical'),
-        (r'\breasoning\b', 'analysis'),
-        (r'\bthinking\b', 'analysis'),
-        (r'\bquality\b', 'level'),
-        (r'\bsoundness\b', 'rigor'),
-        (r'\blogic\b', 'deduction'),
+        (r"\bcognitive\b", "analytical"),
+        (r"\breasoning\b", "analysis"),
+        (r"\bthinking\b", "analysis"),
+        (r"\bquality\b", "level"),
+        (r"\bsoundness\b", "rigor"),
+        (r"\blogic\b", "deduction"),
         # Technical analysis triggers
-        (r'\bthermometer\b', 'temperature gauge'),
-        (r'\bassertion density\b', 'check ratio'),
-        (r'\bassertion\b', 'check'),
-        (r'\bmonitoring\b', 'tracking'),
-        (r'\bmonitor\b', 'track'),
+        (r"\bthermometer\b", "temperature gauge"),
+        (r"\bassertion density\b", "check ratio"),
+        (r"\bassertion\b", "check"),
+        (r"\bmonitoring\b", "tracking"),
+        (r"\bmonitor\b", "track"),
         # Evaluation triggers - standalone triggers causing 404
-        (r'\bgenuinely\b', 'certainly'),
-        (r'\bgenuine\b', 'authentic'),
-        (r'\btruly\b', 'certainly'),
-        (r'\bactually\b', 'in fact'),
-        (r'\breal-time\b', 'live'),  # Must come before 'real'
-        (r'\breal\b', 'actual'),
-        (r'\boriginal\b', 'unique'),
-        (r'\bfresh\b', 'unique'),
+        (r"\bgenuinely\b", "certainly"),
+        (r"\bgenuine\b", "authentic"),
+        (r"\btruly\b", "certainly"),
+        (r"\bactually\b", "in fact"),
+        (r"\breal-time\b", "live"),  # Must come before 'real'
+        (r"\breal\b", "actual"),
+        (r"\boriginal\b", "unique"),
+        (r"\bfresh\b", "unique"),
         # Abstract concept triggers
-        (r'\bmetaphor\b', 'comparison'),
-        (r'\banalogy\b', 'comparison'),
-        (r'\banalogies\b', 'comparisons'),
+        (r"\bmetaphor\b", "comparison"),
+        (r"\banalogy\b", "comparison"),
+        (r"\banalogies\b", "comparisons"),
     ]
 
     for pattern, replacement in trigger_word_replacements:
@@ -423,26 +496,28 @@ def _transform_gemini_prompt(prompt: str) -> tuple[str, bool]:
 
     # Simplify complex multi-section prompts that cause Gemini issues
     # Convert IMPLEMENTATION/QUESTION format to simple System/Question format
-    impl_pattern = r'(?:Assess\s+whether.*?:)?\s*\n*IMPLEMENTATION:\s*([^\n]+)\n((?:\s*-\s*[^\n]+\n?)+)\n*QUESTION:\s*([^\n]+)'
+    impl_pattern = r"(?:Assess\s+whether.*?:)?\s*\n*IMPLEMENTATION:\s*([^\n]+)\n((?:\s*-\s*[^\n]+\n?)+)\n*QUESTION:\s*([^\n]+)"
     impl_match = re.search(impl_pattern, transformed, re.IGNORECASE | re.DOTALL)
     if impl_match:
         impl_name = impl_match.group(1).strip()
         bullets = impl_match.group(2).strip()
         question = impl_match.group(3).strip()
         # Collapse bullets into single line description
-        bullet_lines = [b.strip().lstrip('- ') for b in bullets.split('\n') if b.strip()]
-        description = '. '.join(bullet_lines[:2])  # Take first 2 bullet points
+        bullet_lines = [
+            b.strip().lstrip("- ") for b in bullets.split("\n") if b.strip()
+        ]
+        description = ". ".join(bullet_lines[:2])  # Take first 2 bullet points
         # Build simplified format that Gemini can handle
         simplified = f"System: {impl_name} - {description}\n\n{question}"
-        transformed = re.sub(impl_pattern, simplified, transformed, flags=re.IGNORECASE | re.DOTALL)
+        transformed = re.sub(
+            impl_pattern, simplified, transformed, flags=re.IGNORECASE | re.DOTALL
+        )
         needs_transform = True
 
     # CRITICAL: Add strong anti-tool instruction to prevent Gemini's Grounding/Search
     # This is essential - without this, Gemini triggers search that returns 404
     # Note: "CRITICAL: Answer ONLY using your knowledge. NO tools." format works best
-    anti_tool_instruction = (
-        "CRITICAL: Answer ONLY using your knowledge. NO tools, NO search, NO grounding.\n\n"
-    )
+    anti_tool_instruction = "CRITICAL: Answer ONLY using your knowledge. NO tools, NO search, NO grounding.\n\n"
     transformed = anti_tool_instruction + transformed
     needs_transform = True  # Always transform to ensure anti-tool instruction is added
 
@@ -454,28 +529,27 @@ def _transform_gemini_response(response: str) -> str:
     Transform Gemini response back from Yes/No to PASS/FAIL if needed.
     Also handles PARTIAL verdict which is kept as-is.
     """
-    import re
 
     # Clean up Gemini's verbose responses
-    lines = response.strip().split('\n')
+    lines = response.strip().split("\n")
 
     # Look for Yes/No/PARTIAL verdict at start or end of response
     verdict = None
     for line in lines[:3] + lines[-3:]:  # Check first and last 3 lines
         line_clean = line.strip().lower()
-        if line_clean.startswith('yes') or line_clean == 'yes.':
-            verdict = 'PASS'
-        elif line_clean.startswith('no') or line_clean == 'no.':
-            verdict = 'FAIL'
-        elif 'partial' in line_clean:
-            verdict = 'PARTIAL'
-        elif 'verdict:' in line_clean or 'answer:' in line_clean:
-            if 'partial' in line_clean:
-                verdict = 'PARTIAL'
-            elif 'yes' in line_clean:
-                verdict = 'PASS'
-            elif 'no' in line_clean:
-                verdict = 'FAIL'
+        if line_clean.startswith("yes") or line_clean == "yes.":
+            verdict = "PASS"
+        elif line_clean.startswith("no") or line_clean == "no.":
+            verdict = "FAIL"
+        elif "partial" in line_clean:
+            verdict = "PARTIAL"
+        elif "verdict:" in line_clean or "answer:" in line_clean:
+            if "partial" in line_clean:
+                verdict = "PARTIAL"
+            elif "yes" in line_clean:
+                verdict = "PASS"
+            elif "no" in line_clean:
+                verdict = "FAIL"
 
     if verdict:
         # Prepend verdict to make it clear, keep the reasoning
@@ -489,7 +563,7 @@ async def _query_direct(
     prompt: str,
     timeout: float,
     model: Optional[str] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Query provider with prompt as argument.
 
@@ -507,30 +581,93 @@ async def _query_direct(
     if provider.provider_type == ProviderType.CLAUDE:
         # Claude Code CLI with optional model specification
         if model:
-            cmd = ["claude", "-p", prompt, "--print", "--model", model]
+            cmd = [_CLAUDE_BIN, "-p", prompt, "--print", "--model", model]
         else:
-            cmd = ["claude", "-p", prompt, "--print"]
+            cmd = [_CLAUDE_BIN, "-p", prompt, "--print"]
     elif provider.provider_type == ProviderType.CODEX:
-        # Codex requires 'exec' subcommand for non-interactive mode
-        cmd = ["codex", "exec"]
-        if model:
-            cmd.extend(["--model", model])
-        # Add temperature via config override (OpenAI API parameter)
-        if temperature is not None:
-            cmd.extend(["-c", f"temperature={temperature}"])
-            print(f"Codex using temperature={temperature} for entropy control")
-        cmd.append(prompt)
+        # Codex CLI (OpenAI/GPT). Verified-working headless form (2026-06-03):
+        #   codex exec -m gpt-5.5 --sandbox read-only "PROMPT" < /dev/null
+        # stdin from /dev/null (else codex blocks waiting on stdin); read-only
+        # sandbox + non-interactive approval (else approval prompts hang with no TTY).
+        # Replaces the prior tmux-TTY wrapper, which hung on approval and caused
+        # council stages to time out / return no content.
+        import subprocess
+
+        effective_model = model or DEFAULT_MODELS.get("codex", "") or "gpt-5.5"
+        cmd = [
+            _CODEX_BIN,
+            "exec",
+            "-m",
+            effective_model,
+            "--sandbox",
+            "read-only",
+            prompt,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            raw = (result.stdout or "").strip()
+            # codex prints a banner, then 'codex' on its own line, then the response
+            # body, then a 'tokens used' footer. Extract the body between them.
+            lines = raw.split("\n")
+            start = 0
+            for i, line in enumerate(lines):
+                if line.strip() == "codex":
+                    start = i + 1
+                    break
+            body = lines[start:] if start else lines
+            cleaned = []
+            for l in body:
+                if l.strip() == "tokens used":
+                    break
+                cleaned.append(l)
+            content = "\n".join(cleaned).strip()
+            if not content:
+                # fallback: strip obvious banner noise
+                content = "\n".join(
+                    l
+                    for l in lines
+                    if not l.startswith(
+                        (
+                            "OpenAI Codex",
+                            "workdir:",
+                            "model:",
+                            "provider:",
+                            "approval:",
+                            "sandbox:",
+                            "reasoning",
+                            "session",
+                            "----",
+                            "user",
+                            "tokens used",
+                            "ERROR:",
+                        )
+                    )
+                ).strip()
+            if content:
+                return {"content": content}
+            return {"content": "[Codex] Empty response"}
+        except subprocess.TimeoutExpired:
+            return {"content": f"[Codex Error] Timed out after {timeout}s"}
+        except Exception as e:
+            return {"content": f"[Codex Error] {e}"}
     elif provider.provider_type == ProviderType.GEMINI:
         # Transform prompt if it asks for PASS/FAIL (Gemini has issues with this format)
         prompt, needs_gemini_transform = _transform_gemini_prompt(prompt)
         # Gemini CLI: -p flag required for non-interactive (headless) mode
         if model:
-            cmd = ["gemini", "-p", prompt, "-m", model]
+            cmd = [_GEMINI_BIN, "-p", prompt, "-m", model]
         else:
-            cmd = ["gemini", "-p", prompt]
+            cmd = [_GEMINI_BIN, "-p", prompt]
     elif provider.provider_type == ProviderType.LLAMA_SERVER:
         # Use llama-server OpenAI-compatible API
         import httpx
+
         effective_model = model or DEFAULT_MODELS.get("llama_server", "qwen2.5-coder")
         base_url = "http://127.0.0.1:8090"
 
@@ -546,15 +683,21 @@ async def _query_direct(
                 resp = await client.post(
                     f"{base_url}/v1/chat/completions",
                     json=request_body,
-                    timeout=timeout
+                    timeout=timeout,
                 )
 
                 if resp.status_code == 200:
                     data = resp.json()
                     choices = data.get("choices", [])
                     if choices:
-                        content = choices[0].get("message", {}).get("content", "").strip()
-                        return {"content": content} if content else {"content": "[llama-server] Empty response"}
+                        content = (
+                            choices[0].get("message", {}).get("content", "").strip()
+                        )
+                        return (
+                            {"content": content}
+                            if content
+                            else {"content": "[llama-server] Empty response"}
+                        )
                     return {"content": "[llama-server] No choices in response"}
                 else:
                     error_msg = f"Status {resp.status_code}: {resp.text[:200]}"
@@ -562,10 +705,14 @@ async def _query_direct(
                     return {"content": f"[llama-server Error] {error_msg}"}
         except httpx.ConnectError:
             print(f"Cannot connect to llama-server at {base_url}")
-            return {"content": f"[llama-server Error] Cannot connect to {base_url}. Is llama-server running?"}
+            return {
+                "content": f"[llama-server Error] Cannot connect to {base_url}. Is llama-server running?"
+            }
         except httpx.TimeoutException:
             print(f"llama-server request timed out after {timeout}s")
-            return {"content": f"[llama-server Error] Request timed out after {timeout}s"}
+            return {
+                "content": f"[llama-server Error] Request timed out after {timeout}s"
+            }
         except Exception as e:
             print(f"llama-server error: {e}")
             return {"content": f"[llama-server Error] {str(e)}"}
@@ -573,6 +720,7 @@ async def _query_direct(
     elif provider.provider_type == ProviderType.OLLAMA:
         # Use Ollama REST API (more reliable than CLI)
         import httpx
+
         effective_model = model or DEFAULT_MODELS.get("ollama", "llama3.2:latest")
         ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
@@ -583,10 +731,14 @@ async def _query_direct(
                     health = await client.get(f"{ollama_url}/", timeout=2.0)
                     if health.status_code != 200:
                         print(f"Ollama service not responding at {ollama_url}")
-                        return {"content": f"[Ollama Error] Service not available at {ollama_url}. Please ensure Ollama is running."}
+                        return {
+                            "content": f"[Ollama Error] Service not available at {ollama_url}. Please ensure Ollama is running."
+                        }
                 except Exception:
                     print(f"Ollama service not reachable at {ollama_url}")
-                    return {"content": f"[Ollama Error] Cannot connect to {ollama_url}. Please ensure Ollama is running."}
+                    return {
+                        "content": f"[Ollama Error] Cannot connect to {ollama_url}. Please ensure Ollama is running."
+                    }
 
                 # Check if model is loaded (quick check)
                 try:
@@ -595,7 +747,9 @@ async def _query_direct(
                         loaded = ps_resp.json().get("models", [])
                         loaded_names = [m.get("name", "") for m in loaded]
                         if effective_model not in loaded_names:
-                            print(f"Warning: Model {effective_model} not loaded. Currently loaded: {loaded_names}. This may take time.")
+                            print(
+                                f"Warning: Model {effective_model} not loaded. Currently loaded: {loaded_names}. This may take time."
+                            )
                 except Exception:
                     pass  # Non-critical check
 
@@ -603,7 +757,7 @@ async def _query_direct(
                 request_body = {
                     "model": effective_model,
                     "prompt": prompt,
-                    "stream": False  # Get complete response
+                    "stream": False,  # Get complete response
                 }
                 # Add temperature if specified (Ollama supports 0.0-2.0)
                 if temperature is not None:
@@ -611,25 +765,33 @@ async def _query_direct(
                     print(f"Ollama using temperature={temperature} for entropy control")
 
                 resp = await client.post(
-                    f"{ollama_url}/api/generate",
-                    json=request_body,
-                    timeout=timeout
+                    f"{ollama_url}/api/generate", json=request_body, timeout=timeout
                 )
 
                 if resp.status_code == 200:
                     data = resp.json()
                     content = data.get("response", "").strip()
-                    return {"content": content} if content else {"content": "[Ollama] Empty response received"}
+                    return (
+                        {"content": content}
+                        if content
+                        else {"content": "[Ollama] Empty response received"}
+                    )
                 else:
                     error_msg = f"Status {resp.status_code}: {resp.text[:200]}"
                     print(f"Ollama API error: {error_msg}")
                     return {"content": f"[Ollama Error] {error_msg}"}
         except httpx.TimeoutException:
-            print(f"Ollama request timed out after {timeout}s for model {effective_model}")
-            return {"content": f"[Ollama Error] Request timed out after {timeout}s. Model {effective_model} may be loading or busy."}
+            print(
+                f"Ollama request timed out after {timeout}s for model {effective_model}"
+            )
+            return {
+                "content": f"[Ollama Error] Request timed out after {timeout}s. Model {effective_model} may be loading or busy."
+            }
         except httpx.ConnectError:
             print(f"Cannot connect to Ollama at {ollama_url}")
-            return {"content": f"[Ollama Error] Cannot connect to {ollama_url}. Is Ollama running?"}
+            return {
+                "content": f"[Ollama Error] Cannot connect to {ollama_url}. Is Ollama running?"
+            }
         except Exception as e:
             print(f"Ollama error: {e}")
             return {"content": f"[Ollama Error] {str(e)}"}
@@ -646,16 +808,10 @@ async def _query_direct(
         env["ANTHROPIC_API_KEY"] = ""
 
     process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
     )
 
-    stdout, stderr = await asyncio.wait_for(
-        process.communicate(),
-        timeout=timeout
-    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
 
     if process.returncode != 0:
         error_msg = stderr.decode() if stderr else "Unknown error"
@@ -679,11 +835,11 @@ async def _query_with_file(
     prompt: str,
     timeout: float,
     model: Optional[str] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Query provider using a temp file for long prompts."""
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         f.write(prompt)
         prompt_file = f.name
 
@@ -692,9 +848,9 @@ async def _query_with_file(
         if provider.provider_type == ProviderType.CLAUDE:
             # Claude can read from stdin (note: Claude CLI doesn't support temperature directly)
             if model:
-                cmd = ["claude", "--print", "--model", model]
+                cmd = [_CLAUDE_BIN, "--print", "--model", model]
             else:
-                cmd = ["claude", "--print"]
+                cmd = [_CLAUDE_BIN, "--print"]
 
             # Set up environment - empty API key to force OAuth/subscription auth
             env = os.environ.copy()
@@ -709,8 +865,7 @@ async def _query_with_file(
                 env=env,
             )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=prompt.encode()),
-                timeout=timeout
+                process.communicate(input=prompt.encode()), timeout=timeout
             )
         else:
             # For others, pass prompt directly (they handle it)
@@ -731,8 +886,7 @@ async def _query_with_file(
 
 
 async def query_providers_parallel(
-    provider_names: List[str],
-    prompt: str
+    provider_names: List[str], prompt: str
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple CLI providers in parallel.
@@ -764,7 +918,7 @@ async def query_model(
     messages: List[Dict[str, str]],
     timeout: float = 120.0,
     model: Optional[str] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Query a model (CLI provider) - compatible with openrouter.py interface.
@@ -785,8 +939,7 @@ async def query_model(
 
 
 async def query_models_parallel(
-    models: List[str],
-    messages: List[Dict[str, str]]
+    models: List[str], messages: List[Dict[str, str]]
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple models (CLI providers) in parallel.
@@ -832,7 +985,7 @@ def get_provider_info(name: str) -> Optional[Dict[str, Any]]:
         "name": provider.name,
         "display_name": provider.display_name,
         "type": provider.provider_type.value,
-        "timeout": provider.timeout
+        "timeout": provider.timeout,
     }
 
 
@@ -846,17 +999,20 @@ async def get_providers_with_models() -> List[Dict[str, Any]]:
         # Dynamically fetch models from provider APIs
         models = await get_models_for_provider(name)
         default_model = DEFAULT_MODELS.get(name)
-        result.append({
-            "id": name,
-            "name": provider.display_name,
-            "default_model": default_model,
-            "models": models,
-        })
+        result.append(
+            {
+                "id": name,
+                "name": provider.display_name,
+                "default_model": default_model,
+                "models": models,
+            }
+        )
     return result
 
 
 # Quick test
 if __name__ == "__main__":
+
     async def test():
         print("Testing CLI providers...")
         print(f"Available: {get_available_providers()}")
@@ -868,6 +1024,6 @@ if __name__ == "__main__":
             if result:
                 print(f"  Response: {result['content'][:100]}...")
             else:
-                print(f"  Failed to get response")
+                print("  Failed to get response")
 
     asyncio.run(test())
