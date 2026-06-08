@@ -27,6 +27,9 @@ async def test_list_tools():
     for tool in tools:
         print(f"    - {tool.name}")
     assert len(tools) >= 5, "Expected at least 5 tools"
+    quick_query = next(t for t in tools if t.name == "council_quick_query")
+    provider_enum = quick_query.inputSchema["properties"]["provider"]["enum"]
+    assert "hermes" in provider_enum
     print("  PASSED\n")
 
 
@@ -39,6 +42,7 @@ async def test_get_providers():
     assert "Claude Code" in text or "claude" in text.lower()
     assert "Codex" in text or "codex" in text.lower()
     assert "Gemini" in text or "gemini" in text.lower()
+    assert "Hermes" in text or "hermes" in text.lower()
     print("  PASSED\n")
 
 

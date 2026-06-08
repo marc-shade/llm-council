@@ -28,6 +28,7 @@ CLI_COUNCIL_MODELS = [
     "ollama",  # Ollama Cloud gpt-oss:120b-cloud (OpenAI-compat) - red team (verified)
     "codex",  # Codex CLI (OpenAI gpt-5.5) - re-wired 2026-06-03 to subprocess form
     "claude",  # Claude Code (Anthropic) - restored 2026-06-03 after binary-path fix (was off PATH under launchd)
+    "hermes",  # Hermes Agent (MiniMax-M3 via Hermes config)
     "llama_server",  # llama-server (local llama.cpp, qwen2.5-coder-14b)
 ]
 
@@ -63,6 +64,7 @@ PROVIDER_DISPLAY_NAMES = {
     "claude": "Claude Code (Anthropic)",
     "ollama": "GPT-OSS 120B (Ollama Cloud)",
     "gemini": "Gemini CLI (Google)",
+    "hermes": "Hermes Agent (MiniMax-M3)",
     "llama_server": "llama-server (Local)",
 }
 
@@ -71,5 +73,6 @@ PROVIDER_TIMEOUTS = {
     "claude": 180.0,
     "ollama": 120.0,
     "gemini": 180.0,
+    "hermes": 300.0,
     "llama_server": 300.0,
 }

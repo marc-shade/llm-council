@@ -28,6 +28,7 @@ _BIN_CANDIDATES = {
     ],
     "codex": ["/opt/homebrew/bin/codex", os.path.expanduser("~/.local/bin/codex")],
     "gemini": ["/opt/homebrew/bin/gemini", os.path.expanduser("~/.local/bin/gemini")],
+    "hermes": [os.path.expanduser("~/.local/bin/hermes"), "/opt/homebrew/bin/hermes"],
 }
 
 
@@ -45,6 +46,7 @@ def _resolve_bin(name: str) -> str:
 _CLAUDE_BIN = _resolve_bin("claude")
 _CODEX_BIN = _resolve_bin("codex")
 _GEMINI_BIN = _resolve_bin("gemini")
+_HERMES_BIN = _resolve_bin("hermes")
 
 
 class ProviderType(Enum):
@@ -53,6 +55,7 @@ class ProviderType(Enum):
     CLAUDE = "claude"
     CODEX = "codex"
     GEMINI = "gemini"
+    HERMES = "hermes"
     OLLAMA = "ollama"
     LLAMA_SERVER = "llama_server"
 
@@ -109,6 +112,14 @@ PROVIDERS = {
         args_template=["-p", "{prompt}"],
         timeout=180.0,
     ),
+    "hermes": CLIProvider(
+        name="hermes",
+        provider_type=ProviderType.HERMES,
+        display_name="Hermes Agent",
+        command="hermes",
+        args_template=["--ignore-rules", "-z", "{prompt}"],
+        timeout=300.0,
+    ),
     "ollama": CLIProvider(
         name="ollama",
         provider_type=ProviderType.OLLAMA,
@@ -132,6 +143,7 @@ DEFAULT_MODELS = {
     "claude": "claude-sonnet-4-20250514",  # Safe default
     "codex": "gpt-5.5",  # gpt-5.5 (ChatGPT Pro). Subprocess form (codex exec, stdin /dev/null), not tmux.
     "gemini": "gemini-2.5-pro",
+    "hermes": "MiniMax-M3",  # Hermes Agent default, configured via `hermes model`.
     "ollama": "gpt-oss:120b-cloud",  # OpenAI-compatible model via Ollama Cloud
     "llama_server": "qwen2.5-coder",  # Default model loaded in llama-server
 }
@@ -329,6 +341,8 @@ async def get_models_for_provider(
         models = await _fetch_openai_models()
     elif provider == "gemini":
         models = await _fetch_gemini_models()
+    elif provider == "hermes":
+        models = [{"id": "MiniMax-M3", "name": "MiniMax-M3"}]
     elif provider == "llama_server":
         models = await _fetch_llama_server_models()
     else:
@@ -664,6 +678,18 @@ async def _query_direct(
             cmd = [_GEMINI_BIN, "-p", prompt, "-m", model]
         else:
             cmd = [_GEMINI_BIN, "-p", prompt]
+    elif provider.provider_type == ProviderType.HERMES:
+        # Hermes Agent one-shot mode prints only the final response, making it
+        # suitable for non-interactive council calls. The local Hermes install
+        # uses a custom MiniMax-M3 provider by default; HERMES_PROVIDER can
+        # override this for other Hermes configurations.
+        cmd = [_HERMES_BIN, "--ignore-rules"]
+        hermes_provider = os.environ.get("HERMES_PROVIDER", "custom:minimax-m3").strip()
+        if hermes_provider:
+            cmd.extend(["--provider", hermes_provider])
+        if model:
+            cmd.extend(["--model", model])
+        cmd.extend(["-z", prompt])
     elif provider.provider_type == ProviderType.LLAMA_SERVER:
         # Use llama-server OpenAI-compatible API
         import httpx

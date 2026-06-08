@@ -95,6 +95,7 @@ In addition to OpenRouter, the council can use local CLI tools:
 | **Claude Code** | `claude` | Anthropic's CLI for Claude |
 | **Codex CLI** | `codex` | OpenAI's CLI tool |
 | **Gemini CLI** | `gemini` | Google's CLI tool |
+| **Hermes Agent** | `hermes` | Hermes Agent CLI, using its configured default model |
 
 ### Usage with CLI Providers
 
@@ -103,7 +104,7 @@ from backend.cli_providers import query_providers_parallel
 
 # Query all providers in parallel
 results = await query_providers_parallel(
-    ["claude", "codex", "gemini"],
+    ["claude", "codex", "gemini", "hermes"],
     "Explain the CAP theorem in distributed systems"
 )
 ```

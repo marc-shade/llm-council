@@ -73,6 +73,9 @@ server = Server("llm-council")
 @server.list_tools()
 async def list_tools() -> List[Tool]:
     """List available LLM Council tools."""
+    provider_names = list(PROVIDERS.keys())
+    provider_list = ", ".join(provider_names)
+
     return [
         Tool(
             name="council_deliberate",
@@ -102,17 +105,17 @@ Use this for important questions that benefit from multiple perspectives.""",
         ),
         Tool(
             name="council_quick_query",
-            description="""Query a single LLM provider for a fast response.
+            description=f"""Query a single LLM provider for a fast response.
 
 Use this for quick questions that don't need full council deliberation.
-Available providers: claude, codex, gemini""",
+Available providers: {provider_list}""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Provider to query (claude, codex, or gemini)",
-                        "enum": ["claude", "codex", "gemini"]
+                        "description": f"Provider to query ({provider_list})",
+                        "enum": provider_names
                     },
                     "prompt": {
                         "type": "string",
